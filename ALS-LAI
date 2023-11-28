@@ -1,0 +1,111 @@
+library(tidyverse)
+library(nlme)
+library(optimx)
+library(patchwork)
+library(Matrix)
+library(terra)
+library(sf)
+library(Deriv)
+library(glmnet)
+library(nlme)
+
+#'final_LAD.csv' is a data frame with all the ALS metrics (stdmetrics) from the Lidr package in R, and the observed LAI from field measurement (LAI_c)
+dat <- 
+  read.csv('final_LAD.csv') %>% 
+  rowwise() %>% 
+  mutate(Predio = strsplit(CODE.x,split="-")[[1]][1],
+         Rodal  = strsplit(CODE.x,split="-")[[1]][4],
+         key =paste(Predio,Plot_ID,sep='-'),
+         stand=paste(Predio,Rodal,sep='-')) %>% 
+  mutate(hto=100*zq95/95) %>% 
+  filter(!CODE.x %in% c('30052-1-79-30311-2','80006-1-26-81791-2'))
+
+
+
+weibullcdf <- function(lower, shape, scale, x){
+  ifelse(x>=0 & lower>0, lower + (1-lower)*(1-exp(-(x/scale)^shape)),0)
+}
+
+secondDerivWeibull <- Deriv(weibullcdf, c('x'))
+
+funMin <- function(par, x, y){
+  lower     = par['lower']
+  shape     = par['shape']
+  scale     = par['scale']
+  
+
+  y_hat     = weibullcdf(lower, shape, scale, x)
+
+  resid     = sum((y-y_hat)^2)
+  return(resid)
+}
+
+
+getInitialCrown <- function(zpcumList, hto, plot){
+  y       <- zpcumList/100
+  x       <- (1:9)/10
+  res     <- optimx::optimr(c(lower = 0.1, shape=4, scale=1), 
+                            funMin, 
+                            x=x, y=y)$par
+  lower   <- as.numeric(res['lower'])
+  shape   <- as.numeric(res['shape'])
+  scale   <- as.numeric(res['scale'])
+  
+  # mediante la prediccion extrae el valor minimo
+  hrelseq <- seq(0,1, 0.001)
+  weibullhat <- weibullcdf(lower, shape, scale, hrelseq)
+  meVariat <- weibullhat/hrelseq
+
+  hrFndVal <- hrelseq[meVariat==min(meVariat)]
+  zcFndVal <- weibullcdf(lower, shape, scale, hrFndVal)
+  
+  if(plot){
+    scDervW <- secondDerivWeibull(lower, shape, scale, hrelseq)
+    par(mfrow=c(1,2))
+    plot(weibullhat,hrelseq, ylab='Altura Relativa', xlab='Densidad')
+    points(zcFndVal,hrFndVal, col='red', cex=2, bg='red', pch=21)
+    plot(scDervW*meVariat,hrelseq, ylab='', xlab='cambio en densidad - tasa/media')
+    points(meVariat,hrelseq)
+    points(min(meVariat),hrFndVal, col='red', cex=2, bg='red', pch=21)
+  }
+
+  return(c(lower=as.numeric(lower),shape=as.numeric(shape), scale=as.numeric(scale),hrFndVal=as.numeric(hrFndVal), zcFndVal=as.numeric(zcFndVal)))
+}
+
+
+
+for (rw in 1:nrow(dat)){
+  
+  zpcumList <- with(dat[rw,], c(zpcum1,zpcum2,zpcum3,zpcum4,zpcum5,zpcum6,zpcum7, zpcum8,zpcum9))
+  hto <- dat[rw,]$hto
+  temRow <-  getInitialCrown(zpcumList,hto, plot=F)
+  
+  dat[rw,'lower'] <- temRow[1]
+  dat[rw,'shape'] <- temRow[2]
+  dat[rw,'scale'] <- temRow[3]
+  dat[rw,'hrFndVal'] <- temRow[4]
+  dat[rw,'zcFndVal'] <- temRow[5]
+}
+
+dat <- 
+  dat %>% 
+  mutate(zpcum2m=100*lower,
+         zpcumtot=100*weibullcdf(lower, shape, scale, .95))
+
+
+model.nlme <- nlme(LAI_c~-log(zpcum2m/zpcumtot)/k,
+                         data=dat %>% select(stand, LAI_c,zpcum2m, zpcumtot ) %>% as.data.frame(),
+                         fixed = k~1,
+                         random= k~1|stand,
+                         weights = varPower(value=2.1, form =~ fitted(.)),
+                         start = c(k=0.5),
+                         control=c(maxIter = 1000, pnlsTol=0.001),
+                         verbose = T)
+
+model.nlme2 <- nlme(LAI_c~-log(zpcum2m/zpcumtot)/k,
+     data=dat %>% select(stand, hto, LAI_c,zpcum2m, zpcumtot ) %>% as.data.frame(),
+     fixed = k~1,
+     random= k~hto+1|stand,
+     start = c(k=0.5),
+     control=c(maxIter = 1000, pnlsTol=0.001),
+     verbose = T)
