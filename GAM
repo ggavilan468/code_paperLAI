@@ -1,0 +1,55 @@
+library(lubridate)
+library(fields)
+library(mgcv)
+library(tidyverse)
+library(lattice)
+
+#plot_1, plot_2, plot_3 and plot_4, have the VI extracted per plot, in one column, and the date from the extraction, CODE is the field measure plot unique code 
+my_sdata <- 
+  rbind(
+    read.csv("plot_1.csv"),
+    read.csv("plot_2.csv"),
+    read.csv("plot_3.csv"),
+    read.csv("plot_4.csv")
+  )%>% 
+  filter(!is.na(NDMI)) %>% 
+  group_by(CODE) %>% 
+  mutate(doy=yday(date),
+         Year=as.numeric(substring(date,1,4)),
+         Year2 =  Year + doy/365) %>% 
+  arrange(Year2)
+
+unique_codes <- unique(my_sdata$CODE)
+
+model_list <- list()
+#ajuste inicial para detectar errores
+predicted_data <- do.call(rbind, lapply(unique_codes, function(code) {
+  subset_data <- subset(my_sdata, CODE == code)
+  reg <- gam(NDMI ~ s(Year2, bs = "gp") + s(doy, bs = "cc", k = 7), data = subset_data)
+  model_list[[as.character(code)]] <- reg
+  data.frame(Year2 = subset_data$Year2,
+             doy = subset_data$doy,
+             preds= predict(reg, newdata = subset_data),
+             residual= residuals.gam(reg, newdata = subset_data, type="pearson"),
+             NDMI  = subset_data$NDMI,
+             CODE = code)
+}))
+
+new_model_list <- list()
+#segundo ajuste quitando potenciales errores
+
+predicted_data_new <- do.call(rbind, lapply(unique_codes, function(code) {
+  subset_data <- subset(predicted_data, CODE == code)
+  filtered_data <- subset(subset_data, abs(residual) <= 1)
+  reg_new <- gam(NDMI ~ s(Year2, bs = "gp") + s(doy, bs = "cc", k = 7), data = filtered_data)
+  new_model_list[[as.character(code)]] <- reg_new
+  preds_new = predict(reg_new, newdata = my_sdata[my_sdata$CODE == code, ])
+  return(data.frame(Year2 = my_sdata[my_sdata$CODE == code, ]$Year2, preds = preds_new, CODE = code))
+}))
+
+
+
+predicted_data_new <- 
+  predicted_data_new %>% left_join(
+    my_sdata %>% distinct(CODE, farm, plot),
+    by="CODE")
